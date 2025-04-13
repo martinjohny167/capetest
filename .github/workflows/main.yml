@@ -1,0 +1,196 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: user-management-app
+  TF_WORKING_DIR: ./terraform/environments/prod
+  NODE_ENV: test
+
+jobs:
+  code-scanning:
+    name: Code Scanning
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: javascript
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    needs: code-scanning
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: user_management_test
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install backend dependencies
+        run: npm ci
+        working-directory: ./backend
+
+      - name: Run backend tests with coverage
+        env:
+          DB_HOST: localhost
+          DB_USER: root
+          DB_PASSWORD: root
+          DB_NAME_TEST: user_management_test
+          NODE_ENV: test
+        run: npm test -- --coverage
+        working-directory: ./backend
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: ./backend/coverage
+
+  terraform-validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    needs: code-scanning
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Format
+        run: terraform fmt -check
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [build-and-test, terraform-validate]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Plan
+        run: terraform plan -var="db_password=${{ secrets.DB_PASSWORD }}"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve -var="db_password=${{ secrets.DB_PASSWORD }}"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Get EC2 IP
+        run: |
+          aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=UserManagementApp" \
+            --query 'Reservations[*].Instances[*].PublicIpAddress' \
+            --output text | tee instance_ip.txt
+
+      - name: Build Frontend
+        env:
+          REACT_APP_API_URL: http://$(cat instance_ip.txt):3000/api
+        run: |
+          npm ci
+          npm run build
+        working-directory: ./frontend
+
+      - name: Build and push backend Docker image
+        run: |
+          docker build -t ${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ github.sha }} ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        working-directory: ./backend
+
+      - name: Deploy to EC2
+        env:
+          NODE_ENV: production
+        run: |
+          while read -r ip; do
+            # Copy frontend build to EC2
+            scp -o StrictHostKeyChecking=no -i ${{ secrets.SSH_PRIVATE_KEY }} -r ./frontend/build ec2-user@$ip:/home/ec2-user/frontend
+            
+            # Deploy backend
+            ssh -o StrictHostKeyChecking=no -i ${{ secrets.SSH_PRIVATE_KEY }} ec2-user@$ip "
+              aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+              docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+              docker stop user-management-app || true
+              docker rm user-management-app || true
+              docker run -d --name user-management-app \
+                -p 3000:3000 \
+                -e NODE_ENV=production \
+                -e DB_HOST=${{ secrets.DB_HOST }} \
+                -e DB_USER=${{ secrets.DB_USER }} \
+                -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
+                -e DB_NAME=${{ secrets.DB_NAME }} \
+                -v /home/ec2-user/frontend/build:/app/public \
+                ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            "
+          done < instance_ip.txt
+
+      - name: Output Application URL
+        run: |
+          echo "::notice::✨ Deployment Successful! ✨"
+          echo "::notice::Application URL: http://$(cat instance_ip.txt):3000"
+          echo "::notice::API URL: http://$(cat instance_ip.txt):3000/api"
+          echo "::notice::Please allow a few minutes for the application to fully start" 
