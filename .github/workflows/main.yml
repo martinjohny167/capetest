@@ -76,7 +76,17 @@ jobs:
         run: npm test -- --coverage
         working-directory: ./backend
 
+      - name: Check if coverage folder exists
+        id: check_coverage
+        run: |
+          if [ -d "./backend/coverage" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Upload coverage reports
+        if: steps.check_coverage.outputs.exists == 'true'
         uses: actions/upload-artifact@v3
         with:
           name: coverage-report
