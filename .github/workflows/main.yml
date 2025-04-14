@@ -1,14 +1,14 @@
-name: CI/CD Pipeline
+name: Backend CI/CD Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: user-management-app
+  ECR_REPOSITORY: user-management-backend
   TF_WORKING_DIR: ./terraform/environments/prod
   NODE_ENV: test
 
@@ -34,7 +34,7 @@ jobs:
         uses: github/codeql-action/analyze@v3
 
   build-and-test:
-    name: Build and Test
+    name: Build and Test Backend
     runs-on: ubuntu-latest
     needs: code-scanning
     permissions:
@@ -60,6 +60,7 @@ jobs:
         with:
           node-version: '18'
           cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
 
       - name: Install backend dependencies
         run: npm ci
@@ -81,35 +82,11 @@ jobs:
           name: coverage-report
           path: ./backend/coverage
 
-  terraform-validate:
-    name: Validate Terraform
-    runs-on: ubuntu-latest
-    needs: code-scanning
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-
-      - name: Terraform Init
-        run: terraform init
-        working-directory: ${{ env.TF_WORKING_DIR }}
-
-      - name: Terraform Format
-        run: terraform fmt -check
-        working-directory: ${{ env.TF_WORKING_DIR }}
-
-      - name: Terraform Validate
-        run: terraform validate
-        working-directory: ${{ env.TF_WORKING_DIR }}
-
   deploy:
-    name: Deploy
+    name: Deploy Backend
     runs-on: ubuntu-latest
-    needs: [build-and-test, terraform-validate]
-    if: github.ref == 'refs/heads/main'
+    needs: [build-and-test]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     environment: production
 
     permissions:
@@ -138,7 +115,6 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
 
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main'
         run: terraform apply -auto-approve -var="db_password=${{ secrets.DB_PASSWORD }}"
         working-directory: ${{ env.TF_WORKING_DIR }}
 
@@ -148,14 +124,6 @@ jobs:
             --filters "Name=tag:Name,Values=UserManagementApp" \
             --query 'Reservations[*].Instances[*].PublicIpAddress' \
             --output text | tee instance_ip.txt
-
-      - name: Build Frontend
-        env:
-          REACT_APP_API_URL: http://$(cat instance_ip.txt):3000/api
-        run: |
-          npm ci
-          npm run build
-        working-directory: ./frontend
 
       - name: Build and push backend Docker image
         run: |
@@ -170,9 +138,6 @@ jobs:
           NODE_ENV: production
         run: |
           while read -r ip; do
-            # Copy frontend build to EC2
-            scp -o StrictHostKeyChecking=no -i ${{ secrets.SSH_PRIVATE_KEY }} -r ./frontend/build ec2-user@$ip:/home/ec2-user/frontend
-            
             # Deploy backend
             ssh -o StrictHostKeyChecking=no -i ${{ secrets.SSH_PRIVATE_KEY }} ec2-user@$ip "
               aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
@@ -186,14 +151,13 @@ jobs:
                 -e DB_USER=${{ secrets.DB_USER }} \
                 -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
                 -e DB_NAME=${{ secrets.DB_NAME }} \
-                -v /home/ec2-user/frontend/build:/app/public \
+                -e CORS_ORIGIN=${{ secrets.FRONTEND_URL }} \
                 ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
             "
           done < instance_ip.txt
 
-      - name: Output Application URL
+      - name: Output Backend API URL
         run: |
-          echo "::notice::✨ Deployment Successful! ✨"
-          echo "::notice::Application URL: http://$(cat instance_ip.txt):3000"
-          echo "::notice::API URL: http://$(cat instance_ip.txt):3000/api"
-          echo "::notice::Please allow a few minutes for the application to fully start" 
+          echo "::notice::✨ Backend Deployment Successful! ✨"
+          echo "::notice::Backend API URL: http://$(cat instance_ip.txt):3000/api"
+          echo "::notice::Please allow a few minutes for the backend to fully start" 
