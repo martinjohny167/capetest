@@ -76,7 +76,7 @@ jobs:
         working-directory: ./backend
 
       - name: Upload coverage reports
-        uses: actions/upload-artifact@v3.0.0
+        uses: actions/upload-artifact@v3
         with:
           name: coverage-report
           path: ./backend/coverage
