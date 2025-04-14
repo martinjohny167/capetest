@@ -66,31 +66,15 @@ jobs:
         run: npm ci
         working-directory: ./backend
 
-      - name: Run backend tests with coverage
+      - name: Run backend tests
         env:
           DB_HOST: localhost
           DB_USER: root
           DB_PASSWORD: root
           DB_NAME_TEST: user_management_test
           NODE_ENV: test
-        run: npm test -- --coverage
+        run: npm test
         working-directory: ./backend
-
-      - name: Check if coverage folder exists
-        id: check_coverage
-        run: |
-          if [ -d "./backend/coverage" ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload coverage reports
-        if: steps.check_coverage.outputs.exists == 'true'
-        uses: actions/upload-artifact@v3
-        with:
-          name: coverage-report
-          path: ./backend/coverage
 
   deploy:
     name: Deploy Backend
