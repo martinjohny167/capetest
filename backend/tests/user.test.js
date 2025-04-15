@@ -1,73 +1,101 @@
 const request = require('supertest');
-const app = require('../server');
-const { User } = require('../models/user');
+const { app, pool, closePool } = require('../server');
+require('dotenv').config({ path: '.env.test' });
 
-describe('User Management API', () => {
-  beforeEach(async () => {
-    await User.destroy({ where: {} }); // Clear users table
-  });
+let server;
 
-  describe('POST /api/users', () => {
-    it('should create a new user', async () => {
-      const res = await request(app)
-        .post('/api/users')
-        .send({
-          username: 'testuser',
-          email: 'test@example.com',
-          password: 'password123'
-        });
-      
-      expect(res.statusCode).toBe(201);
-      expect(res.body).toHaveProperty('id');
-      expect(res.body.username).toBe('testuser');
-      expect(res.body.email).toBe('test@example.com');
-    });
+beforeAll(async () => {
+  try {
+    // Create test server
+    server = app.listen(0);
+    
+    // Get connection from pool
+    const connection = await pool.getConnection();
+    
+    // Make sure we're using the test database
+    await connection.query(`USE ${process.env.DB_NAME_TEST}`);
+    
+    // Clear the users table
+    await connection.query('DELETE FROM users');
+    
+    connection.release();
+  } catch (error) {
+    console.error('Setup error:', error);
+    throw error;
+  }
+});
 
-    it('should validate required fields', async () => {
-      const res = await request(app)
-        .post('/api/users')
-        .send({});
-      
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toHaveProperty('errors');
-    });
-  });
+afterAll(async () => {
+  if (server) {
+    await new Promise((resolve) => server.close(resolve));
+  }
+  await closePool();
+});
 
-  describe('GET /api/users', () => {
-    it('should return all users', async () => {
-      await User.create({
-        username: 'testuser',
+describe('User Management API Tests', () => {
+  // Test 1: Register a new user
+  test('should register a new user successfully', async () => {
+    const res = await request(server)
+      .post('/api/auth/register')
+      .send({
+        name: 'Test User',
         email: 'test@example.com',
         password: 'password123'
       });
 
-      const res = await request(app).get('/api/users');
-      
-      expect(res.statusCode).toBe(200);
-      expect(Array.isArray(res.body)).toBeTruthy();
-      expect(res.body.length).toBe(1);
-    });
+    expect(res.status).toBe(201);
+    expect(res.body.user).toHaveProperty('id');
+    expect(res.body.user.name).toBe('Test User');
+    expect(res.body.user.email).toBe('test@example.com');
   });
 
-  describe('GET /api/users/:id', () => {
-    it('should return a user by ID', async () => {
-      const user = await User.create({
-        username: 'testuser',
+  // Test 2: Login with valid credentials
+  test('should login successfully with valid credentials', async () => {
+    const res = await request(server)
+      .post('/api/auth/login')
+      .send({
         email: 'test@example.com',
         password: 'password123'
       });
 
-      const res = await request(app).get(`/api/users/${user.id}`);
-      
-      expect(res.statusCode).toBe(200);
-      expect(res.body.id).toBe(user.id);
-      expect(res.body.username).toBe('testuser');
-    });
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Login successful');
+    expect(res.body.user).toHaveProperty('id');
+  });
 
-    it('should return 404 for non-existent user', async () => {
-      const res = await request(app).get('/api/users/999');
-      
-      expect(res.statusCode).toBe(404);
-    });
+  // Test 3: Get all users
+  test('should get list of all users', async () => {
+    const res = await request(server)
+      .get('/api/users');
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+  });
+
+  // Test 4: Register with invalid data
+  test('should fail to register user with missing required fields', async () => {
+    const res = await request(server)
+      .post('/api/auth/register')
+      .send({
+        name: 'Invalid User',
+        // email is missing
+        password: 'password123'
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('Name, email and password are required');
+  });
+
+  // Test 5: Login with invalid credentials
+  test('should fail to login with wrong password', async () => {
+    const res = await request(server)
+      .post('/api/auth/login')
+      .send({
+        email: 'test@example.com',
+        password: 'wrongpassword'
+      });
+
+    expect(res.status).toBe(401);
+    expect(res.body.message).toBe('Invalid credentials');
   });
 }); 
