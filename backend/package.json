@@ -6,7 +6,6 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "setup-test-db": "node scripts/setup-test-db.js",
     "test": "npm run setup-test-db && jest --detectOpenHandles --forceExit"
   },
   "keywords": [],
